@@ -1,66 +1,138 @@
-﻿import os
-import sys
+﻿import ast
 import json
+import os
 import sqlite3
 import subprocess
-import pandas as pd
+import sys
+import tempfile
+import time
+from pathlib import Path
+
 import matplotlib
+import pandas as pd
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DEFAULT_DB_PATH = os.path.join(PROJECT_ROOT, "company_sales.db")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DB_PATH = PROJECT_ROOT / "company_sales.db"
 
-BLOCKED_PYTHON_TOKENS = [
-    "os.system",
-    "os.popen",
-    "os.remove",
-    "os.unlink",
-    "os.rmdir",
-    "os.removedirs",
-    "shutil.",
-    "subprocess.",
-    "socket.",
-    "urllib.",
-    "requests.",
+MAX_SQL_ROWS = 200
+MAX_OUTPUT_CHARS = 4000
+MAX_FILE_BYTES = 1_000_000
+
+ALLOWED_SQL_ACTIONS = {
+    sqlite3.SQLITE_SELECT,
+    sqlite3.SQLITE_READ,
+    sqlite3.SQLITE_FUNCTION,
+    sqlite3.SQLITE_RECURSIVE,
+}
+
+ALLOWED_PYTHON_IMPORTS = {
+    "pandas",
+    "pd",
+    "numpy",
+    "np",
+    "math",
+    "statistics",
+    "datetime",
+    "json",
+}
+
+BLOCKED_PYTHON_CALLS = {
+    "open",
+    "eval",
+    "exec",
+    "compile",
+    "getattr",
+    "setattr",
+    "delattr",
+    "globals",
+    "locals",
+    "vars",
     "__import__",
-    "eval(",
-    "exec(",
-    "compile(",
-]
+    "input",
+    "breakpoint",
+}
+
+ALLOWED_READ_EXTENSIONS = {".csv", ".json", ".txt", ".md"}
+ALLOWED_REPORT_EXTENSIONS = {".md", ".txt"}
 
 
-def _resolve_db_path(db_path: str = None) -> str:
-    if db_path and os.path.exists(db_path):
-        return db_path
-    if os.path.exists("company_sales.db"):
-        return os.path.abspath("company_sales.db")
-    return DEFAULT_DB_PATH
+def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [truncated {len(text) - limit} chars]"
 
 
-def _resolve_safe_path(user_path: str, base_dir: str = PROJECT_ROOT) -> tuple[bool, str]:
-    abs_base = os.path.abspath(base_dir)
-    target = os.path.abspath(os.path.join(abs_base, user_path)) if not os.path.isabs(user_path) else os.path.abspath(user_path)
-    if os.path.commonpath([abs_base, target]) != abs_base:
-        return False, "Security Error: Path outside project workspace is not allowed."
-    return True, target
+def _wrap_untrusted(label: str, content: str) -> str:
+    return f"<{label}>\n{content}\n</{label}>"
 
 
-def _is_safe_python_code(code: str) -> tuple[bool, str]:
-    for token in BLOCKED_PYTHON_TOKENS:
-        if token in code:
-            return False, f"Security Error: Restricted Python construct '{token}' is not allowed."
-    if "open(" in code and any(mode in code for mode in ['"w"', "'w'", '"a"', "'a'", '"x"', "'x'", '"r+"', "'r+'"]):
-        return False, "Security Error: Writing or modifying files inside python_analyst is not allowed."
+def _resolve_db_path(db_path: str | None = None) -> Path:
+    if db_path:
+        p = Path(db_path).resolve()
+        if p.exists():
+            return p
+    cwd_db = (Path.cwd() / "company_sales.db").resolve()
+    if cwd_db.exists():
+        return cwd_db
+    return DEFAULT_DB_PATH.resolve()
+
+
+def _resolve_safe_path(user_path: str, base_dir: Path = PROJECT_ROOT) -> tuple[bool, Path | str]:
+    try:
+        base_resolved = base_dir.resolve()
+        raw_path = Path(user_path)
+        candidate = raw_path.resolve() if raw_path.is_absolute() else (base_resolved / raw_path).resolve()
+        if not candidate.is_relative_to(base_resolved):
+            return False, "Security Error: Path outside project workspace is not allowed."
+        return True, candidate
+    except (OSError, ValueError) as exc:
+        return False, f"Security Error: Invalid path ({exc})."
+
+
+def _validate_python_ast(code: str) -> tuple[bool, str]:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return False, f"Syntax Error in Python code: {exc}"
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root_mod = alias.name.split(".")[0]
+                if root_mod not in ALLOWED_PYTHON_IMPORTS:
+                    return False, f"Security Error: Import '{alias.name}' is not allowed."
+        elif isinstance(node, ast.ImportFrom):
+            mod_name = node.module or ""
+            root_mod = mod_name.split(".")[0]
+            if root_mod not in ALLOWED_PYTHON_IMPORTS:
+                return False, f"Security Error: Importing from '{mod_name}' is not allowed."
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__"):
+                return False, f"Security Error: Access to dunder attribute '{node.attr}' is not allowed."
+        elif isinstance(node, ast.Name):
+            if node.id.startswith("__"):
+                return False, f"Security Error: Access to dunder name '{node.id}' is not allowed."
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in BLOCKED_PYTHON_CALLS:
+                return False, f"Security Error: Call to '{node.func.id}' is not allowed."
+            if isinstance(node.func, ast.Attribute) and node.func.attr in BLOCKED_PYTHON_CALLS:
+                return False, f"Security Error: Call to '.{node.func.attr}' is not allowed."
+
     return True, ""
 
 
 def inspect_database() -> str:
-    """Returns all table names, column schemas, and sample values in the SQLite database."""
+    """Returns table names, SQL schemas, and sample rows from the SQLite database in read-only mode."""
     db_path = _resolve_db_path()
+    if not db_path.exists():
+        return "Database Error: Database file does not exist."
     try:
-        conn = sqlite3.connect(db_path)
+        uri = f"{db_path.as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.execute("PRAGMA query_only = ON;")
         cursor = conn.cursor()
         cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='table';")
         tables = cursor.fetchall()
@@ -78,40 +150,67 @@ def inspect_database() -> str:
                 f"Table: {table_name}\nSchema: {schema_sql}\nSample Rows: {json.dumps(samples, ensure_ascii=False)}"
             )
         conn.close()
-        return "\n\n".join(sections)
-    except Exception as e:
-        return f"Database Inspection Error: {str(e)}"
+        return _wrap_untrusted("DATABASE_SCHEMA_AND_SAMPLES", "\n\n".join(sections))
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return f"Database Inspection Error: {exc}"
 
 
 def run_sql_query(query: str) -> str:
-    """Executes a read-only SELECT SQL query on the database and returns the rows."""
+    """Executes a single read-only SELECT query enforced by SQLite authorizer, progress limit, and row cap."""
     db_path = _resolve_db_path()
-    try:
-        cleaned = query.strip()
-        if not cleaned.upper().startswith("SELECT"):
-            return "Security Error: Only SELECT queries are allowed."
-        forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "ATTACH", "PRAGMA"]
-        upper_q = cleaned.upper()
-        if any(word in upper_q for word in forbidden):
-            return "Security Error: Potentially destructive or non-read-only SQL keyword detected."
+    if not db_path.exists():
+        return "Database Error: Database file does not exist."
 
-        conn = sqlite3.connect(db_path)
+    cleaned = query.strip()
+    if not cleaned:
+        return "SQL Error: Empty query."
+
+    deadline = time.monotonic() + 3.0
+
+    def _authorizer(action, arg1, arg2, dbname, source):
+        return sqlite3.SQLITE_OK if action in ALLOWED_SQL_ACTIONS else sqlite3.SQLITE_DENY
+
+    def _progress():
+        return 1 if time.monotonic() > deadline else 0
+
+    try:
+        uri = f"{db_path.as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        conn.execute("PRAGMA query_only = ON;")
+        conn.set_authorizer(_authorizer)
+        conn.set_progress_handler(_progress, 10_000)
+
         cursor = conn.cursor()
         cursor.execute(cleaned)
-        columns = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description] if cursor.description else []
+        fetched = cursor.fetchmany(MAX_SQL_ROWS + 1)
         conn.close()
+
+        truncated = len(fetched) > MAX_SQL_ROWS
+        rows = fetched[:MAX_SQL_ROWS]
         if not rows:
             return "Query executed successfully, but returned 0 rows."
+
         result = [dict(zip(columns, row)) for row in rows]
-        return json.dumps(result, ensure_ascii=False)
-    except Exception as e:
-        return f"SQL Execution Error: {str(e)}"
+        payload = {
+            "row_count": len(rows),
+            "truncated": truncated,
+            "rows": result,
+        }
+        return _wrap_untrusted("SQL_QUERY_RESULT", _truncate(json.dumps(payload, ensure_ascii=False)))
+    except sqlite3.OperationalError as exc:
+        if "interrupt" in str(exc).lower():
+            return "SQL Execution Error: Query timed out (exceeded 3s progress budget)."
+        return f"SQL Execution Error: {exc}"
+    except sqlite3.DatabaseError as exc:
+        return f"Security or SQL Error: {exc}"
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        return f"SQL Execution Error: {exc}"
 
 
 def python_analyst(code: str) -> str:
-    """Executes safe Python code (with pandas/numpy available) for math, statistics, or data analysis. Always print() the final result."""
-    safe, reason = _is_safe_python_code(code)
+    """Executes AST-validated Python code in an isolated temp directory with a stripped environment."""
+    safe, reason = _validate_python_ast(code)
     if not safe:
         return reason
 
@@ -120,55 +219,63 @@ def python_analyst(code: str) -> str:
         "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
         "PYTHONIOENCODING": "utf-8",
     }
+
     try:
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            cwd=PROJECT_ROOT,
-            env=clean_env,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or "Code executed successfully (no output printed)."
-        else:
-            return f"Python Error: {result.stderr.strip()}"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            proc = subprocess.run(
+                [sys.executable, "-I", "-c", code],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=8,
+                cwd=tmp_dir,
+                env=clean_env,
+            )
+        if proc.returncode == 0:
+            out = proc.stdout.strip() or "Code executed successfully (no output printed)."
+            return _wrap_untrusted("PYTHON_OUTPUT", _truncate(out))
+        return f"Python Error: {_truncate(proc.stderr.strip())}"
     except subprocess.TimeoutExpired:
         return "Error: Python execution timed out after 8 seconds."
-    except Exception as e:
-        return f"System Error: {str(e)}"
+    except (OSError, ValueError) as exc:
+        return f"System Error: {exc}"
 
 
 def read_file(filepath: str, max_rows: int = 20) -> str:
-    """Reads CSV, JSON, TXT, or Markdown files inside the project workspace and returns a structured preview."""
-    allowed, safe_path = _resolve_safe_path(filepath)
+    """Safely reads workspace CSV, JSON, TXT, or Markdown files within the project workspace."""
+    allowed, resolved = _resolve_safe_path(filepath)
     if not allowed:
-        return safe_path
-    if not os.path.exists(safe_path):
+        return str(resolved)
+    target = Path(resolved)
+    if not target.exists() or not target.is_file():
         return f"File Error: '{filepath}' does not exist."
 
-    ext = os.path.splitext(safe_path)[1].lower()
+    ext = target.suffix.lower()
+    if ext not in ALLOWED_READ_EXTENSIONS:
+        return f"Security Error: Unsupported or disallowed file extension '{ext}'."
+
+    if target.stat().st_size > MAX_FILE_BYTES:
+        return f"File Error: '{filepath}' exceeds maximum allowed size ({MAX_FILE_BYTES} bytes)."
+
+    bounded_rows = max(1, min(int(max_rows), 100))
+
     try:
         if ext == ".csv":
-            df = pd.read_csv(safe_path)
+            df = pd.read_csv(target)
             summary = {
                 "rows": len(df),
                 "columns": list(df.columns),
                 "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
-                "preview": df.head(max_rows).to_dict(orient="records"),
+                "preview": df.head(bounded_rows).to_dict(orient="records"),
             }
-            return json.dumps(summary, ensure_ascii=False, indent=2)
-        elif ext == ".json":
-            with open(safe_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            text = json.dumps(data, ensure_ascii=False, indent=2)
-            return text[:4000] + ("\n... [truncated]" if len(text) > 4000 else "")
-        else:
-            with open(safe_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return content[:4000] + ("\n... [truncated]" if len(content) > 4000 else "")
-    except Exception as e:
-        return f"File Read Error: {str(e)}"
+            return _wrap_untrusted("FILE_CONTENT_CSV", _truncate(json.dumps(summary, ensure_ascii=False, indent=2)))
+        if ext == ".json":
+            data = json.loads(target.read_text(encoding="utf-8"))
+            return _wrap_untrusted("FILE_CONTENT_JSON", _truncate(json.dumps(data, ensure_ascii=False, indent=2)))
+        content = target.read_text(encoding="utf-8")
+        return _wrap_untrusted("FILE_CONTENT_TEXT", _truncate(content))
+    except (OSError, ValueError, json.JSONDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError) as exc:
+        return f"File Read Error: {exc}"
 
 
 def generate_chart(
@@ -185,12 +292,17 @@ def generate_chart(
         if not labels or not values or len(labels) != len(values):
             return "Chart Error: 'labels' and 'values' must be non-empty lists of equal length."
 
-        charts_dir = os.path.join(PROJECT_ROOT, "reports", "charts")
-        os.makedirs(charts_dir, exist_ok=True)
-        safe_name = os.path.basename(filename)
-        if not safe_name.lower().endswith(".png"):
-            safe_name += ".png"
-        out_path = os.path.join(charts_dir, safe_name)
+        charts_dir = PROJECT_ROOT / "reports" / "charts"
+        charts_dir.mkdir(parents=True, exist_ok=True)
+
+        raw_name = Path(filename).name
+        if not raw_name.lower().endswith(".png"):
+            raw_name += ".png"
+
+        allowed, resolved = _resolve_safe_path(raw_name, base_dir=charts_dir)
+        if not allowed:
+            return str(resolved)
+        out_path = Path(resolved)
 
         plt.figure(figsize=(8, 4.8), dpi=150)
         ctype = chart_type.strip().lower()
@@ -247,26 +359,38 @@ def generate_chart(
         plt.savefig(out_path)
         plt.close()
 
-        rel_path = os.path.relpath(out_path, PROJECT_ROOT)
+        rel_path = out_path.relative_to(PROJECT_ROOT)
         return f"Chart successfully generated and saved to {rel_path}"
-    except Exception as e:
+    except (OSError, ValueError, RuntimeError) as exc:
         plt.close("all")
-        return f"Chart Generation Error: {str(e)}"
+        return f"Chart Generation Error: {exc}"
 
 
 def save_report(filename: str, content: str) -> str:
-    """Saves a final analytical report or summary into reports/."""
+    """Safely saves a Markdown or text report under reports/ without overwriting existing files."""
+    reports_dir = PROJECT_ROOT / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_name = Path(filename).name
+    if not raw_name:
+        return "File Save Error: Invalid filename."
+
+    allowed, resolved = _resolve_safe_path(raw_name, base_dir=reports_dir)
+    if not allowed:
+        return str(resolved)
+    filepath = Path(resolved)
+
+    if filepath.suffix.lower() not in ALLOWED_REPORT_EXTENSIONS:
+        return f"Security Error: Report extension '{filepath.suffix}' is not allowed. Use .md or .txt."
+
+    if filepath.exists():
+        return f"File Save Error: '{filepath.relative_to(PROJECT_ROOT)}' already exists. Choose a new filename."
+
     try:
-        reports_dir = os.path.join(PROJECT_ROOT, "reports")
-        os.makedirs(reports_dir, exist_ok=True)
-        safe_name = os.path.basename(filename)
-        filepath = os.path.join(reports_dir, safe_name)
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
-        rel_path = os.path.relpath(filepath, PROJECT_ROOT)
-        return f"Report successfully saved to {rel_path}"
-    except Exception as e:
-        return f"File Save Error: {str(e)}"
+        filepath.write_text(content, encoding="utf-8")
+        return f"Report successfully saved to {filepath.relative_to(PROJECT_ROOT)}"
+    except (OSError, ValueError) as exc:
+        return f"File Save Error: {exc}"
 
 
 TOOLS_MAP = {
@@ -282,21 +406,21 @@ TOOLS_DECLARATIONS = [{
     "functionDeclarations": [
         {
             "name": "inspect_database",
-            "description": "Returns all table names, column schemas, and sample rows in the SQLite database.",
+            "description": "Returns table names, SQL schemas, and sample rows from the read-only SQLite database.",
             "parameters": {"type": "OBJECT", "properties": {}}
         },
         {
             "name": "run_sql_query",
-            "description": "Executes a read-only SELECT SQL query on the database and returns the rows as JSON.",
+            "description": "Executes a read-only SELECT SQL query on the database and returns rows as JSON.",
             "parameters": {
                 "type": "OBJECT",
-                "properties": {"query": {"type": "STRING", "description": "Valid SQLite SELECT query"}},
+                "properties": {"query": {"type": "STRING", "description": "Read-only SQLite SELECT query"}},
                 "required": ["query"]
             }
         },
         {
             "name": "python_analyst",
-            "description": "Executes safe Python code (pandas, numpy, math) for statistics, aggregations, or percentages. Always print() the final result.",
+            "description": "Executes safe Python code (pandas, numpy, math, statistics, datetime, json) for statistics or transformations. Always print() the final result.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {"code": {"type": "STRING", "description": "Python code to execute"}},
@@ -305,11 +429,11 @@ TOOLS_DECLARATIONS = [{
         },
         {
             "name": "read_file",
-            "description": "Reads CSV, JSON, TXT, or Markdown files in the project workspace and returns schema/preview or text.",
+            "description": "Safely reads workspace CSV, JSON, TXT, or Markdown files and returns structure/preview or text.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
-                    "filepath": {"type": "STRING", "description": "Relative or workspace file path"},
+                    "filepath": {"type": "STRING", "description": "Relative workspace file path"},
                     "max_rows": {"type": "INTEGER", "description": "Max rows preview for CSV files (default 20)"}
                 },
                 "required": ["filepath"]
@@ -317,14 +441,14 @@ TOOLS_DECLARATIONS = [{
         },
         {
             "name": "generate_chart",
-            "description": "Generates and saves a PNG chart (bar, barh, line, pie) under reports/charts/.",
+            "description": "Generates and saves a PNG chart (bar, barh, line, or pie) under reports/charts/.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
-                    "chart_type": {"type": "STRING", "description": "One of: bar, barh, line, pie"},
+                    "chart_type": {"type": "STRING", "enum": ["bar", "barh", "line", "pie"], "description": "Chart type"},
                     "title": {"type": "STRING", "description": "Chart title"},
-                    "labels": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Category or x-axis labels"},
-                    "values": {"type": "ARRAY", "items": {"type": "NUMBER"}, "description": "Numeric values corresponding to labels"},
+                    "labels": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Category labels"},
+                    "values": {"type": "ARRAY", "items": {"type": "NUMBER"}, "description": "Numeric values"},
                     "filename": {"type": "STRING", "description": "Output PNG filename e.g. dept_sales.png"},
                     "xlabel": {"type": "STRING", "description": "Optional x-axis label"},
                     "ylabel": {"type": "STRING", "description": "Optional y-axis label"}
@@ -334,12 +458,12 @@ TOOLS_DECLARATIONS = [{
         },
         {
             "name": "save_report",
-            "description": "Saves a final analytical report or summary into reports/.",
+            "description": "Saves a new Markdown (.md) or text (.txt) report under reports/.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
-                    "filename": {"type": "STRING", "description": "Filename e.g. report.md"},
-                    "content": {"type": "STRING", "description": "Markdown report content"}
+                    "filename": {"type": "STRING", "description": "Report filename e.g. summary.md"},
+                    "content": {"type": "STRING", "description": "Report content"}
                 },
                 "required": ["filename", "content"]
             }

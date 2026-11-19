@@ -1,5 +1,6 @@
 ﻿import sqlite3
 
+
 def create_sample_db():
     conn = sqlite3.connect("company_sales.db")
     cursor = conn.cursor()

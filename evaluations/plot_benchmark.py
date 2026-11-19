@@ -1,8 +1,8 @@
-﻿import os
-import sys
-import glob
+﻿import glob
 import json
+import os
 from collections import Counter
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -38,7 +38,7 @@ def plot_benchmark_summary():
         for tool_name in t.get("tools_used", []):
             tool_counts[tool_name] += 1
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.8), dpi=150)
+    _fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.8), dpi=150)
 
     bars = ax1.bar(test_labels, steps, color="#2563EB", alpha=0.9)
     ax1.set_title("Steps per Benchmark Task (100% Pass)", fontsize=11, fontweight="bold")
