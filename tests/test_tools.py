@@ -39,6 +39,7 @@ def test_python_ast_sandbox():
 
 def test_path_traversal_and_report_guard():
     assert "Security Error" in read_file("../../outside_secret.txt")
+    assert "Security Error" in read_file(".env")
     assert "Security Error" in save_report("evil.exe", "bad")
 
     test_rep_name = "pytest_temp_report.md"

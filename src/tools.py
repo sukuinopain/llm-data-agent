@@ -247,6 +247,9 @@ def read_file(filepath: str, max_rows: int = 20) -> str:
     if not allowed:
         return str(resolved)
     target = Path(resolved)
+    if target.name.lower() == ".env" or target.name.lower().startswith(".env."):
+        return "Security Error: Reading environment files is not allowed."
+
     if not target.exists() or not target.is_file():
         return f"File Error: '{filepath}' does not exist."
 
