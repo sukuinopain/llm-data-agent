@@ -3,6 +3,7 @@ import math
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -160,7 +161,9 @@ def run_benchmark(repeats: int = 1) -> dict:
     records = []
 
     for repeat_idx in range(1, repeats + 1):
-        for spec in tasks:
+        for idx, spec in enumerate(tasks):
+            if repeat_idx > 1 or idx > 0:
+                time.sleep(2.0)
             res = run_agent(spec["prompt"], max_steps=6, save_trace=True)
             passed, reason = evaluate_task(spec, res)
             records.append({

@@ -35,6 +35,8 @@ def test_python_ast_sandbox():
     assert "Security Error" in python_analyst("import sqlite3\nsqlite3.connect('company_sales.db')")
     assert "Security Error" in python_analyst("open('.env').read()")
     assert "Security Error" in python_analyst("getattr(__builtins__, 'eval')")
+    assert "Security Error" in python_analyst("import pandas as pd\npd.read_csv('company_sales.db')")
+    assert "Security Error" in python_analyst("print('{.__class__.__mro__}'.format(1))")
 
 
 def test_path_traversal_and_report_guard():

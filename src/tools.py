@@ -1,6 +1,7 @@
 ﻿import ast
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -39,7 +40,27 @@ ALLOWED_PYTHON_IMPORTS = {
     "json",
 }
 
+MAX_PYTHON_CODE_CHARS = 20_000
+
+BLOCKED_PYTHON_CALLS_EXTRA = {
+    "read_csv",
+    "read_excel",
+    "read_parquet",
+    "read_json",
+    "read_sql",
+    "read_table",
+    "read_fwf",
+    "read_pickle",
+    "to_csv",
+    "to_excel",
+    "to_parquet",
+    "to_json",
+    "to_sql",
+    "to_pickle",
+}
+
 BLOCKED_PYTHON_CALLS = {
+    *BLOCKED_PYTHON_CALLS_EXTRA,
     "open",
     "eval",
     "exec",
@@ -92,6 +113,20 @@ def _resolve_safe_path(user_path: str, base_dir: Path = PROJECT_ROOT) -> tuple[b
         return False, f"Security Error: Invalid path ({exc})."
 
 
+
+
+def _has_risky_format_call(node: ast.Call) -> bool:
+    if not (isinstance(node.func, ast.Attribute) and node.func.attr == "format"):
+        return False
+    if isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, str):
+        tmpl = node.func.value.value
+        for match in re.finditer(r"\{([^{}]+)\}", tmpl):
+            expr = match.group(1).split("!", 1)[0].split(":", 1)[0].strip()
+            if "." in expr or "[" in expr or expr.startswith("_"):
+                return True
+    return False
+
+
 def _validate_python_ast(code: str) -> tuple[bool, str]:
     try:
         tree = ast.parse(code)
@@ -116,6 +151,8 @@ def _validate_python_ast(code: str) -> tuple[bool, str]:
             if node.id.startswith("__"):
                 return False, f"Security Error: Access to dunder name '{node.id}' is not allowed."
         elif isinstance(node, ast.Call):
+            if _has_risky_format_call(node):
+                return False, "Security Error: Format string attribute or index access is not allowed."
             if isinstance(node.func, ast.Name) and node.func.id in BLOCKED_PYTHON_CALLS:
                 return False, f"Security Error: Call to '{node.func.id}' is not allowed."
             if isinstance(node.func, ast.Attribute) and node.func.attr in BLOCKED_PYTHON_CALLS:

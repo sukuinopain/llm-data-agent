@@ -16,6 +16,16 @@ from src.tools import TOOLS_DECLARATIONS, TOOLS_MAP, _resolve_db_path, inspect_d
 
 MODEL = "gemini-3.1-flash-lite"
 
+def _configure_console_utf8() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if callable(reconf):
+            try:
+                reconf(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 _SCHEMA_CACHE: dict = {"mtime": None, "content": ""}
 
 
@@ -104,6 +114,13 @@ def _build_system_prompt() -> str:
     if schema_context:
         return f"{base_prompt}\n\nCached Database Context:\n{schema_context}"
     return base_prompt
+
+
+def _build_initial_user_message(task: str) -> str:
+    schema_context = _get_cached_schema()
+    if schema_context:
+        return f"{task}\n\nReference Database Context:\n{schema_context}"
+    return task
 
 
 def run_agent(task: str, max_steps: int = 8, save_trace: bool = True) -> dict:
