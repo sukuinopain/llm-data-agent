@@ -1,24 +1,40 @@
-﻿name: CI
+name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-and-lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest ruff
+          python -m pip install -r requirements.txt pytest ruff
+
+      - name: Initialize sample database
+        run: python -m src.setup_db
+
       - name: Run ruff lint
         run: ruff check src tests evaluations
+
       - name: Run pytest suite
-        run: pytest -q
+        run: python -m pytest -q
