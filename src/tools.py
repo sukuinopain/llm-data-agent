@@ -1,5 +1,6 @@
 ﻿import ast
 import json
+import math
 import os
 import re
 import sqlite3
@@ -331,6 +332,10 @@ def generate_chart(
     try:
         if not labels or not values or len(labels) != len(values):
             return "Chart Error: 'labels' and 'values' must be non-empty lists of equal length."
+
+        for val in values:
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
+                return "Chart Error: 'values' must contain only finite numbers."
 
         charts_dir = PROJECT_ROOT / "reports" / "charts"
         charts_dir.mkdir(parents=True, exist_ok=True)

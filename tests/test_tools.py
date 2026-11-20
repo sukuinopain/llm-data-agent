@@ -106,3 +106,24 @@ def test_mock_llm_loop_detection_and_max_steps():
     assert res["status"] == "failed_max_steps"
     assert res["steps"] == 4
     assert calls["count"] >= 4
+
+def test_generate_chart_rejects_non_finite_values():
+    from src.tools import generate_chart
+
+    res_nan = generate_chart(
+        chart_type="bar",
+        title="Invalid Chart",
+        labels=["A", "B"],
+        values=[10.0, float("nan")],
+        filename="test_nan_chart.png",
+    )
+    assert "Chart Error" in res_nan
+
+    res_inf = generate_chart(
+        chart_type="bar",
+        title="Infinite Chart",
+        labels=["A", "B"],
+        values=[10.0, float("inf")],
+        filename="test_inf_chart.png",
+    )
+    assert "Chart Error" in res_inf
