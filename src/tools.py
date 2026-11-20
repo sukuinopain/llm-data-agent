@@ -2,8 +2,8 @@
 import json
 import math
 import os
-import re
 import sqlite3
+import string
 import subprocess
 import sys
 import tempfile
@@ -49,19 +49,53 @@ BLOCKED_PYTHON_CALLS_EXTRA = {
     "read_parquet",
     "read_json",
     "read_sql",
+    "read_sql_query",
+    "read_sql_table",
     "read_table",
     "read_fwf",
     "read_pickle",
+    "read_html",
+    "read_xml",
+    "read_feather",
+    "read_orc",
+    "read_stata",
+    "read_sas",
+    "read_spss",
+    "read_hdf",
+    "read_clipboard",
+    "read_gbq",
     "to_csv",
     "to_excel",
     "to_parquet",
     "to_json",
     "to_sql",
     "to_pickle",
+    "to_feather",
+    "to_orc",
+    "to_stata",
+    "to_hdf",
+    "to_html",
+    "to_xml",
+    "to_clipboard",
+    "ExcelFile",
+    "ExcelWriter",
+    "HDFStore",
+    "get_handle",
+    "loadtxt",
+    "genfromtxt",
+    "fromfile",
+    "tofile",
+    "load",
+    "save",
+    "savez",
+    "savez_compressed",
+    "savetxt",
+    "memmap",
+    "DataSource",
+    "dump",
 }
 
-BLOCKED_PYTHON_CALLS = {
-    *BLOCKED_PYTHON_CALLS_EXTRA,
+BLOCKED_PYTHON_BUILTINS = {
     "open",
     "eval",
     "exec",
@@ -75,6 +109,35 @@ BLOCKED_PYTHON_CALLS = {
     "__import__",
     "input",
     "breakpoint",
+}
+
+BLOCKED_PYTHON_CALLS = {
+    *BLOCKED_PYTHON_CALLS_EXTRA,
+    *BLOCKED_PYTHON_BUILTINS,
+    "format_map",
+}
+
+BLOCKED_PYTHON_SUBMODULES = {
+    "io",
+    "compat",
+    "ctypeslib",
+    "testing",
+    "f2py",
+    "distutils",
+}
+
+BLOCKED_IMPORTED_NAMES = {
+    "os",
+    "sys",
+    "subprocess",
+    "sqlite3",
+    "pathlib",
+    "shutil",
+    "socket",
+    "ctypes",
+    "importlib",
+    "builtins",
+    "io",
 }
 
 ALLOWED_READ_EXTENSIONS = {".csv", ".json", ".txt", ".md"}
@@ -116,15 +179,36 @@ def _resolve_safe_path(user_path: str, base_dir: Path = PROJECT_ROOT) -> tuple[b
 
 
 
-def _has_risky_format_call(node: ast.Call) -> bool:
-    if not (isinstance(node.func, ast.Attribute) and node.func.attr == "format"):
-        return False
-    if isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, str):
-        tmpl = node.func.value.value
-        for match in re.finditer(r"\{([^{}]+)\}", tmpl):
-            expr = match.group(1).split("!", 1)[0].split(":", 1)[0].strip()
-            if "." in expr or "[" in expr or expr.startswith("_"):
+def _is_risky_format_template(tmpl: str, depth: int = 0) -> bool:
+    if depth > 2:
+        return True
+    try:
+        parsed = list(string.Formatter().parse(tmpl))
+    except ValueError:
+        return True
+    for _, field_name, format_spec, _ in parsed:
+        if field_name is not None and field_name != "":
+            is_simple_pos = field_name.isdigit()
+            is_simple_ident = field_name.isidentifier() and not field_name.startswith("_")
+            if not (is_simple_pos or is_simple_ident):
                 return True
+        if (
+            format_spec
+            and ("{" in format_spec or "}" in format_spec)
+            and _is_risky_format_template(format_spec, depth + 1)
+        ):
+            return True
+    return False
+
+
+def _has_risky_format_call(node: ast.Call) -> bool:
+    if isinstance(node.func, ast.Attribute):
+        if node.func.attr == "format_map":
+            return True
+        if node.func.attr == "format":
+            if not (isinstance(node.func.value, ast.Constant) and isinstance(node.func.value.value, str)):
+                return True
+            return _is_risky_format_template(node.func.value.value)
     return False
 
 
@@ -134,23 +218,51 @@ def _validate_python_ast(code: str) -> tuple[bool, str]:
     except SyntaxError as exc:
         return False, f"Syntax Error in Python code: {exc}"
 
+    safe_format_attr_ids: set[int] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "format"
+            and not _has_risky_format_call(node)
+        ):
+            safe_format_attr_ids.add(id(node.func))
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                root_mod = alias.name.split(".")[0]
-                if root_mod not in ALLOWED_PYTHON_IMPORTS:
+                parts = alias.name.split(".")
+                if parts[0] not in ALLOWED_PYTHON_IMPORTS or any(
+                    p.startswith("_") or p in BLOCKED_PYTHON_SUBMODULES for p in parts[1:]
+                ):
                     return False, f"Security Error: Import '{alias.name}' is not allowed."
         elif isinstance(node, ast.ImportFrom):
             mod_name = node.module or ""
-            root_mod = mod_name.split(".")[0]
-            if root_mod not in ALLOWED_PYTHON_IMPORTS:
+            parts = mod_name.split(".")
+            if parts[0] not in ALLOWED_PYTHON_IMPORTS or any(
+                p.startswith("_") or p in BLOCKED_PYTHON_SUBMODULES for p in parts[1:]
+            ):
                 return False, f"Security Error: Importing from '{mod_name}' is not allowed."
+            for alias in node.names:
+                if (
+                    alias.name == "*"
+                    or alias.name.startswith("_")
+                    or alias.name in BLOCKED_PYTHON_CALLS
+                    or alias.name in BLOCKED_IMPORTED_NAMES
+                ):
+                    return False, f"Security Error: Importing '{alias.name}' from '{mod_name}' is not allowed."
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith("__"):
                 return False, f"Security Error: Access to dunder attribute '{node.attr}' is not allowed."
+            if node.attr in BLOCKED_PYTHON_CALLS:
+                return False, f"Security Error: Access to blocked attribute '{node.attr}' is not allowed."
+            if node.attr == "format" and id(node) not in safe_format_attr_ids:
+                return False, "Security Error: Only direct literal string '.format(...)' calls are allowed."
         elif isinstance(node, ast.Name):
             if node.id.startswith("__"):
                 return False, f"Security Error: Access to dunder name '{node.id}' is not allowed."
+            if node.id in BLOCKED_PYTHON_BUILTINS:
+                return False, f"Security Error: Access to blocked builtin '{node.id}' is not allowed."
         elif isinstance(node, ast.Call):
             if _has_risky_format_call(node):
                 return False, "Security Error: Format string attribute or index access is not allowed."
@@ -248,6 +360,11 @@ def run_sql_query(query: str) -> str:
 
 def python_analyst(code: str) -> str:
     """Executes AST-validated Python code in an isolated temp directory with a stripped environment."""
+    if not isinstance(code, str) or not code.strip():
+        return "Python Error: Empty code."
+    if len(code) > MAX_PYTHON_CODE_CHARS:
+        return f"Security Error: Python code exceeds maximum allowed length ({MAX_PYTHON_CODE_CHARS} chars)."
+
     safe, reason = _validate_python_ast(code)
     if not safe:
         return reason
@@ -288,17 +405,19 @@ def read_file(filepath: str, max_rows: int = 20) -> str:
     if target.name.lower() == ".env" or target.name.lower().startswith(".env."):
         return "Security Error: Reading environment files is not allowed."
 
-    if not target.exists() or not target.is_file():
-        return f"File Error: '{filepath}' does not exist."
-
     ext = target.suffix.lower()
     if ext not in ALLOWED_READ_EXTENSIONS:
         return f"Security Error: Unsupported or disallowed file extension '{ext}'."
 
+    if isinstance(max_rows, bool) or not isinstance(max_rows, int):
+        return "File Read Error: 'max_rows' must be an integer."
+    bounded_rows = max(1, min(max_rows, 100))
+
+    if not target.exists() or not target.is_file():
+        return f"File Error: '{filepath}' does not exist."
+
     if target.stat().st_size > MAX_FILE_BYTES:
         return f"File Error: '{filepath}' exceeds maximum allowed size ({MAX_FILE_BYTES} bytes)."
-
-    bounded_rows = max(1, min(int(max_rows), 100))
 
     try:
         if ext == ".csv":

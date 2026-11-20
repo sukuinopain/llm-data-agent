@@ -8,6 +8,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import src.agent as agent_mod
 from src.tools import (
+    MAX_PYTHON_CODE_CHARS,
     generate_chart,
     inspect_database,
     python_analyst,
@@ -108,22 +109,88 @@ def test_mock_llm_loop_detection_and_max_steps():
     assert calls["count"] >= 4
 
 def test_generate_chart_rejects_non_finite_values():
-    from src.tools import generate_chart
+    charts_dir = PROJECT_ROOT / "reports" / "charts"
+    test_cases = [
+        ([10.0, float("nan")], "test_nan_chart.png"),
+        ([10.0, float("inf")], "test_inf_chart.png"),
+        ([10.0, float("-inf")], "test_ninf_chart.png"),
+        ([10.0, True], "test_bool_chart.png"),
+    ]
+    created_paths = [charts_dir / fname for _, fname in test_cases]
+    try:
+        for values, fname in test_cases:
+            res = generate_chart(
+                chart_type="bar",
+                title="Invalid Chart",
+                labels=["A", "B"],
+                values=values,
+                filename=fname,
+            )
+            assert "Chart Error" in res
+            assert not (charts_dir / fname).exists()
+    finally:
+        for path in created_paths:
+            if path.exists():
+                path.unlink()
 
-    res_nan = generate_chart(
-        chart_type="bar",
-        title="Invalid Chart",
-        labels=["A", "B"],
-        values=[10.0, float("nan")],
-        filename="test_nan_chart.png",
-    )
-    assert "Chart Error" in res_nan
 
-    res_inf = generate_chart(
-        chart_type="bar",
-        title="Infinite Chart",
-        labels=["A", "B"],
-        values=[10.0, float("inf")],
-        filename="test_inf_chart.png",
+def test_read_file_extension_order_and_max_rows_guards():
+    assert "Security Error" in read_file("nonexistent_secret.key")
+    assert "Security Error" in read_file("missing_tool.exe")
+    assert "Security Error" in read_file(".env")
+    assert "Security Error" in read_file(".env.local")
+    assert "Security Error" in read_file(".env.json")
+
+    for bad_max_rows in ("abc", 3.5, None, True):
+        res = read_file("reports/missing.csv", max_rows=bad_max_rows)
+        assert "File Read Error" in res
+
+    temp_csv = PROJECT_ROOT / "reports" / "pytest_temp_read.csv"
+    try:
+        temp_csv.parent.mkdir(parents=True, exist_ok=True)
+        temp_csv.write_text("dept,sales\nElectronics,100\nSoftware,200\n", encoding="utf-8")
+
+        ok_res = read_file("reports/pytest_temp_read.csv", max_rows=1)
+        assert "<FILE_CONTENT_CSV>" in ok_res and "Electronics" in ok_res
+
+        bad_res = read_file("reports/pytest_temp_read.csv", max_rows="bad")
+        assert "File Read Error" in bad_res
+    finally:
+        if temp_csv.exists():
+            temp_csv.unlink()
+
+
+def test_python_analyst_hardening_guards():
+    oversized = "x = 1\n" * (MAX_PYTHON_CODE_CHARS // 5)
+    assert "Security Error" in python_analyst(oversized)
+
+    blocked_snippets = [
+        '"{x.__class__}".format_map({"x": 1})',
+        'tmpl = "{.__class__}"\nprint(tmpl.format(1))',
+        'print(("{." + "__class__}").format(1))',
+        'print(str.format("{.__class__}", 1))',
+        'print("{0.__class__:{1}}".format(1, 10))',
+        'f = str.format\nprint(f("{.__class__}", 1))',
+        "fn = open\nprint(fn('.env').read())",
+        "import pandas as pd\nf = pd.read_csv\nprint(f('x.csv'))",
+        "import pandas as pd\nprint(pd.read_sql_query('SELECT 1', None))",
+        "import numpy as np\nprint(np.loadtxt('x.csv'))",
+        "import numpy as np\nprint(np.fromfile('x.bin'))",
+        "from pandas.io.common import get_handle",
+        "import numpy.ctypeslib",
+    ]
+    for snippet in blocked_snippets:
+        assert "Security Error" in python_analyst(snippet), f"Expected Security Error for: {snippet}"
+
+    fmt_ok = python_analyst('print("Total: {val:,.2f}".format(val=1234.5))')
+    assert "<PYTHON_OUTPUT>" in fmt_ok and "1,234.50" in fmt_ok
+
+    analytics_ok = python_analyst(
+        "import json\n"
+        "import numpy as np\n"
+        "import pandas as pd\n"
+        "df = pd.DataFrame({'a': [10, 20, 30]})\n"
+        "res = {'mean': float(np.mean(df['a'])), 'sum': int(df['a'].sum())}\n"
+        "print(json.dumps(res))"
     )
-    assert "Chart Error" in res_inf
+    assert "<PYTHON_OUTPUT>" in analytics_ok and "20.0" in analytics_ok and "60" in analytics_ok
